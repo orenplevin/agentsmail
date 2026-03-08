@@ -256,4 +256,4 @@ MIT — see [LICENSE](LICENSE)
 
 ---
 
-Built with Cloudflare Workers. Open source at [github.com/agentsmail/agentsmail](https://github.com/agentsmail/agentsmail).
+Built with Cloudflare Workers.
