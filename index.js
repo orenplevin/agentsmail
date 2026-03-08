@@ -26,6 +26,9 @@ const MAX_BODY_SIZE = 1024 * 1024 // 1MB request body limit
 const READ_RATE_LIMIT = { limit: 120, windowSec: 60 }   // 120 reads per minute per API key
 const SEARCH_RATE_LIMIT = { limit: 30, windowSec: 60 }  // 30 searches per minute per API key
 
+// Brute-force protection: lock out after N failed auth attempts per IP
+const AUTH_FAIL_LIMIT = { limit: 15, windowSec: 900 }   // 15 failures per 15 min per IP
+
 // ── Helpers ──
 
 async function hashApiKey(key) {
@@ -102,13 +105,28 @@ function getApiKey(request) {
 async function authenticate(request, env) {
   const apiKey = getApiKey(request)
   if (!apiKey) return null
+
+  // Brute-force protection: check failed auth attempts per IP
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown'
+  const failKey = `auth_fail:${ip}`
+  const failCount = parseInt(await env.RATE_LIMITS.get(failKey) || '0')
+  if (failCount >= AUTH_FAIL_LIMIT.limit) {
+    console.warn(`[SECURITY] Auth locked out for IP ${ip} (${failCount} failures)`)
+    return null
+  }
+
   try {
     const keyHash = await hashApiKey(apiKey)
     const raw = await env.ACCOUNTS.get(`key:${keyHash}`)
     if (!raw) {
       // Fallback: check unhashed key for backwards compatibility with existing accounts
       const legacyRaw = await env.ACCOUNTS.get(`key:${apiKey}`)
-      if (!legacyRaw) return null
+      if (!legacyRaw) {
+        // Record failed attempt
+        await env.RATE_LIMITS.put(failKey, String(failCount + 1), { expirationTtl: AUTH_FAIL_LIMIT.windowSec })
+        console.warn(`[SECURITY] Failed auth attempt from IP ${ip} (attempt ${failCount + 1})`)
+        return null
+      }
       // Migrate to hashed key on successful auth
       const account = JSON.parse(legacyRaw)
       account.key_hash = keyHash
@@ -342,7 +360,7 @@ async function handleSignup(request, env) {
   if (!email || !email.includes('@')) return error('Valid email is required', 400, env)
 
   const existing = await env.ACCOUNTS.get(`email:${email}`)
-  if (existing) return error('Email already registered', 409, env)
+  if (existing) return error('Unable to create account. If you already have an account, use your existing API key.', 409, env)
 
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown'
   const allowed = await checkRateLimit(`signup:${ip}`, 5, 3600, env)
@@ -374,9 +392,9 @@ async function handleSignup(request, env) {
     mailboxes: [],
     webhooks: [],
     webhook_url: null,
-    // FIX: Per-account secret for signing outbound webhook payloads.
-    // Consumers verify: X-AgentsMail-Signature: sha256=<hmac(body, webhook_secret)>
     webhook_secret: generateId(32),
+    verified: false,
+    verification_token: generateId(24),
     created_at: new Date().toISOString(),
     plan,
     limits: { ...PLANS[plan] },
@@ -398,9 +416,28 @@ async function handleSignup(request, env) {
     env.ACCOUNTS.put(`email:${email}`, JSON.stringify({ account_id: accountId })),
   ])
 
+  // Send verification email via Mailgun
+  if (env.MAILGUN_API_KEY) {
+    const mailgunDomain = env.MAILGUN_DOMAIN || DOMAIN
+    const verifyUrl = `https://api.${DOMAIN}/api/account/verify?token=${account.verification_token}&id=${accountId}`
+    const verifyBody = new FormData()
+    verifyBody.append('from', `AgentsMail <noreply@${mailgunDomain}>`)
+    verifyBody.append('to', email)
+    verifyBody.append('subject', 'Verify your AgentsMail account')
+    verifyBody.append('text', `Welcome to AgentsMail!\n\nPlease verify your account by visiting:\n${verifyUrl}\n\nOr use the API:\ncurl -X POST https://api.${DOMAIN}/api/account/verify \\\n  -H "Authorization: Bearer ${apiKey}" \\\n  -H "Content-Type: application/json" \\\n  -d '{"token": "${account.verification_token}"}'\n\nYou can read emails immediately, but sending requires verification.\n\n— AgentsMail`)
+    verifyBody.append('html', `<p>Welcome to AgentsMail!</p><p><a href="${verifyUrl}">Click here to verify your account</a></p><p>You can read emails immediately, but sending requires verification.</p><p style="color:#888;font-size:12px">— AgentsMail</p>`)
+    try {
+      await fetch(`https://api.eu.mailgun.net/v3/${mailgunDomain}/messages`, {
+        method: 'POST',
+        headers: { 'Authorization': 'Basic ' + btoa('api:' + env.MAILGUN_API_KEY) },
+        body: verifyBody,
+      })
+    } catch (e) { console.error('Failed to send verification email:', e.message) }
+  }
+
   const result = {
-    message: 'Account created', account_id: accountId, api_key: apiKey,
-    email, plan, limits: account.limits,
+    message: 'Account created. Check your email to verify.', account_id: accountId, api_key: apiKey,
+    email, plan, limits: account.limits, verified: false,
   }
   if (firstMailboxAddress) result.first_mailbox = firstMailboxAddress
 
@@ -416,11 +453,51 @@ async function handleGetAccount(request, env) {
     id: account.id, email: account.email, name: account.name,
     mailboxes: account.mailboxes, webhooks: account.webhooks || [],
     webhook_url: account.webhook_url,
-    // Expose webhook_secret so account owners can verify incoming webhook signatures
     webhook_secret: account.webhook_secret || null,
+    verified: account.verified !== false,
     plan: account.plan, limits: account.limits,
     created_at: account.created_at,
   }, 200, env)
+}
+
+// POST /api/account/verify — verify account via token
+async function handleVerifyAccount(request, env) {
+  const url = new URL(request.url)
+
+  // Support GET with query params (email link) or POST with bearer + JSON body
+  let account, token
+  if (request.method === 'GET') {
+    token = url.searchParams.get('token')
+    const accountId = url.searchParams.get('id')
+    if (!token || !accountId) return error('Missing token or id', 400, env)
+    const raw = await env.ACCOUNTS.get(`account:${accountId}`)
+    if (!raw) return error('Account not found', 404, env)
+    account = JSON.parse(raw)
+  } else {
+    account = await authenticate(request, env)
+    if (!account) return error('Unauthorized', 401, env)
+    try {
+      const body = await request.json()
+      token = body.token
+    } catch { return error('Invalid JSON body', 400, env) }
+  }
+
+  if (!token) return error('Verification token required', 400, env)
+
+  if (account.verified) return json({ message: 'Account already verified', verified: true }, 200, env)
+
+  if (account.verification_token !== token) {
+    return error('Invalid verification token', 403, env)
+  }
+
+  account.verified = true
+  delete account.verification_token
+  await saveAccount(account, env)
+  // Also update the account record by ID
+  await env.ACCOUNTS.put(`account:${account.id}`, JSON.stringify(account))
+
+  console.log(`[ACCOUNT] Verified: ${account.email} (${account.id})`)
+  return json({ message: 'Account verified', verified: true }, 200, env)
 }
 
 // POST /api/account/rotate-key
@@ -790,6 +867,7 @@ async function handleSearchAll(request, env) {
 async function handleSendEmail(request, env, fromAddress, ctx) {
   const account = await authenticate(request, env)
   if (!account) return error('Unauthorized', 401, env)
+  if (account.verified === false) return error('Account not verified. Check your email for the verification link.', 403, env)
   if (!account.mailboxes.includes(fromAddress)) return error('Mailbox not found or not owned by you', 404, env)
 
   const allowed = await checkRateLimit(
@@ -843,8 +921,10 @@ async function handleSendEmail(request, env, fromAddress, ctx) {
   formData.append('from', `${fromName} <${fromAddress}>`)
   formData.append('to', to)
   formData.append('subject', subject)
-  if (text) formData.append('text', text)
-  if (html) formData.append('html', html)
+  const footer = '\n\n—\nSent with agentsmail.net'
+  const htmlFooter = '<br><br><p style="color:#999;font-size:11px">Sent with <a href="https://agentsmail.net" style="color:#999">agentsmail.net</a></p>'
+  if (text) formData.append('text', text + footer)
+  if (html) formData.append('html', html + htmlFooter)
   formData.append('h:Message-ID', outboundMessageId)
   if (inReplyToHeader) formData.append('h:In-Reply-To', inReplyToHeader)
   if (referencesHeader) formData.append('h:References', referencesHeader)
@@ -1008,14 +1088,15 @@ async function verifyMailgunSignature(timestamp, token, signature, apiKey) {
 
 // POST /webhook/inbound — receive from Mailgun or other HTTP sources
 async function handleInboundEmail(request, env, ctx) {
-  // FIX: Check optional path-level inbound secret as a second factor.
-  // Set INBOUND_SECRET in your Worker environment to enable.
-  // Mailgun sends this via a custom header you configure in your routing rules.
-  if (env.INBOUND_SECRET) {
-    const providedSecret = request.headers.get('X-Inbound-Secret') || ''
-    if (!(await timingSafeEqual(providedSecret, env.INBOUND_SECRET))) {
-      return error('Unauthorized', 403, env)
-    }
+  // Require INBOUND_SECRET as a mandatory second factor for webhook ingress.
+  // Fail-closed: if INBOUND_SECRET is not configured, reject all inbound webhooks.
+  if (!env.INBOUND_SECRET) {
+    console.error('INBOUND_SECRET not configured — rejecting inbound webhook')
+    return error('Inbound webhooks not configured', 503, env)
+  }
+  const providedSecret = request.headers.get('X-Inbound-Secret') || ''
+  if (!(await timingSafeEqual(providedSecret, env.INBOUND_SECRET))) {
+    return error('Unauthorized', 403, env)
   }
 
   let recipient, sender, subject, bodyPlain, bodyHtml
@@ -1113,11 +1194,19 @@ async function handleInboundEmail(request, env, ctx) {
 
 // GET /api/admin/stats
 async function handleAdminStats(request, env) {
-  // FIX: Use constant-time comparison to prevent timing oracle on the admin key.
-  // Also gate explicitly when ADMIN_API_KEY is not configured.
+  // Admin auth: timing-safe key check + optional IP allowlist
   const apiKey = getApiKey(request)
   if (!apiKey || !env.ADMIN_API_KEY || !(await timingSafeEqual(apiKey, env.ADMIN_API_KEY))) {
     return error('Unauthorized', 401, env)
+  }
+  // Optional IP restriction: set ADMIN_ALLOWED_IPS as comma-separated IPs
+  if (env.ADMIN_ALLOWED_IPS) {
+    const ip = request.headers.get('CF-Connecting-IP') || ''
+    const allowed = env.ADMIN_ALLOWED_IPS.split(',').map(s => s.trim())
+    if (!allowed.includes(ip)) {
+      console.warn(`[SECURITY] Admin access denied for IP ${ip}`)
+      return error('Forbidden', 403, env)
+    }
   }
 
   // Count accounts by listing KV keys with prefix "account:"
@@ -1256,6 +1345,8 @@ export default {
     // Reject oversized request bodies
     const contentLength = parseInt(request.headers.get('Content-Length') || '0')
     if (contentLength > MAX_BODY_SIZE) {
+      const ip = request.headers.get('CF-Connecting-IP') || 'unknown'
+      console.warn(`[SECURITY] Oversized request rejected: ${contentLength} bytes | IP: ${ip} | ${method} ${path}`)
       return error('Request body too large (max 1MB)', 413, env)
     }
 
@@ -1269,6 +1360,7 @@ export default {
       if (path === '/api/signup' && method === 'POST') return handleSignup(request, env)
       if (path === '/api/account' && method === 'GET') return handleGetAccount(request, env)
       if (path === '/api/account/rotate-key' && method === 'POST') return handleRotateKey(request, env)
+      if (path === '/api/account/verify' && (method === 'POST' || method === 'GET')) return handleVerifyAccount(request, env)
 
       // Webhook routes
       if (path === '/api/webhooks' && method === 'PUT') return handleSetWebhooks(request, env)
@@ -1284,7 +1376,11 @@ export default {
         const rl = isSearch ? SEARCH_RATE_LIMIT : READ_RATE_LIMIT
         const rlKey = `rl:${isSearch ? 'search' : 'read'}:${keyHash}`
         const allowed = await checkRateLimit(rlKey, rl.limit, rl.windowSec, env)
-        if (!allowed) return error('Rate limit exceeded. Try again shortly.', 429, env)
+        if (!allowed) {
+          const ip = request.headers.get('CF-Connecting-IP') || 'unknown'
+          console.warn(`[SECURITY] Rate limit hit: ${isSearch ? 'search' : 'read'} | IP: ${ip} | ${path}`)
+          return error('Rate limit exceeded. Try again shortly.', 429, env)
+        }
       }
 
       // Search across all mailboxes
@@ -1355,7 +1451,8 @@ export default {
       return error('Not found', 404, env)
 
     } catch (e) {
-      console.error('Unhandled error:', e)
+      const ip = request.headers.get('CF-Connecting-IP') || 'unknown'
+      console.error(`[ERROR] Unhandled: ${e.message} | ${method} ${path} | IP: ${ip}`)
       return error('Internal server error', 500, env)
     }
   },
