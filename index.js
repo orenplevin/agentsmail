@@ -1018,21 +1018,23 @@ async function handleAdminStats(request, env) {
 
   // Count accounts by listing KV keys with prefix "account:"
   let totalAccounts = 0
+  let totalMessages = 0
   let cursor = null
   const plans = {}
   const recentSignups = []
+  const accountDetails = []
 
   do {
     const list = await env.ACCOUNTS.list({ prefix: 'account:', limit: 1000, cursor })
     for (const key of list.keys) {
       totalAccounts++
-      // Fetch account details for plan breakdown + recent signups
       try {
         const raw = await env.ACCOUNTS.get(key.name)
         if (raw) {
           const acct = JSON.parse(raw)
           plans[acct.plan || 'free'] = (plans[acct.plan || 'free'] || 0) + 1
           recentSignups.push({ id: acct.id, email: acct.email, plan: acct.plan, created_at: acct.created_at })
+          accountDetails.push(acct)
         }
       } catch { /* skip */ }
     }
@@ -1043,20 +1045,43 @@ async function handleAdminStats(request, env) {
   recentSignups.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
   const recent = recentSignups.slice(0, 10)
 
-  // Count total mailboxes
+  // Fetch per-account mailbox details with message counts
   let totalMailboxes = 0
-  let mbCursor = null
-  do {
-    const list = await env.MAILBOXES.list({ prefix: 'mailbox:', limit: 1000, cursor: mbCursor })
-    totalMailboxes += list.keys.length
-    mbCursor = list.list_complete ? null : list.cursor
-  } while (mbCursor)
+  const accountStats = []
+  for (const acct of accountDetails) {
+    const mailboxStats = []
+    let acctMsgCount = 0
+    for (const addr of (acct.mailboxes || [])) {
+      totalMailboxes++
+      try {
+        const mbRaw = await env.MAILBOXES.get(`mailbox:${addr}`)
+        if (mbRaw) {
+          const mb = JSON.parse(mbRaw)
+          const msgCount = (mb.messages || []).length
+          acctMsgCount += msgCount
+          totalMessages += msgCount
+          mailboxStats.push({ address: addr, message_count: msgCount, created_at: mb.created_at })
+        }
+      } catch { /* skip */ }
+    }
+    accountStats.push({
+      id: acct.id,
+      email: acct.email,
+      plan: acct.plan || 'free',
+      created_at: acct.created_at,
+      mailbox_count: (acct.mailboxes || []).length,
+      total_messages: acctMsgCount,
+      mailboxes: mailboxStats,
+    })
+  }
 
   return json({
     total_accounts: totalAccounts,
     total_mailboxes: totalMailboxes,
+    total_messages: totalMessages,
     plans,
     recent_signups: recent,
+    accounts: accountStats,
   }, 200, env)
 }
 
